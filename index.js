@@ -1,112 +1,192 @@
 const TelegramBot = require('node-telegram-bot-api');
+const https = require('https');
+const http = require('http');
 
-const token = process.env.BOT_TOKEN;
-const siteUrl = (process.env.SITE_URL || '').replace(/\/+$/, '');
-const botSecret = process.env.BOT_API_SECRET || '';
+const BOT_TOKEN = process.env.BOT_TOKEN || '';
+const SITE_URL = (process.env.SITE_URL || '').replace(/\/+$/, '');
+const BOT_API_SECRET = process.env.BOT_API_SECRET || '';
 
-if (!token) { console.error('Missing BOT_TOKEN'); process.exit(1); }
-if (!siteUrl) { console.error('Missing SITE_URL'); process.exit(1); }
-if (!botSecret) { console.error('Missing BOT_API_SECRET'); process.exit(1); }
+if (!BOT_TOKEN) throw new Error('ENV BOT_TOKEN is empty');
+if (!SITE_URL) throw new Error('ENV SITE_URL is empty');
+if (!BOT_API_SECRET) throw new Error('ENV BOT_API_SECRET is empty');
 
-const bot = new TelegramBot(token, { polling: true });
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-async function api(path, method = 'GET', body = null) {
-  const res = await fetch(siteUrl + path, {
-    method,
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Bot-Secret': botSecret
-    },
-    body: body ? JSON.stringify(body) : null
+function reqJson(method, urlStr, bodyObj) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const lib = u.protocol === 'https:' ? https : http;
+
+    const body = bodyObj ? Buffer.from(JSON.stringify(bodyObj), 'utf8') : null;
+
+    const opts = {
+      method,
+      hostname: u.hostname,
+      port: u.port || (u.protocol === 'https:' ? 443 : 80),
+      path: u.pathname + (u.search || ''),
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'X-Bot-Secret': BOT_API_SECRET,
+      },
+    };
+
+    if (body) opts.headers['Content-Length'] = String(body.length);
+
+    const r = lib.request(opts, (res) => {
+      let data = '';
+      res.on('data', (c) => (data += c));
+      res.on('end', () => {
+        try {
+          const j = data ? JSON.parse(data) : {};
+          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) return resolve(j);
+          return reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+        } catch (e) {
+          return reject(new Error(`Bad JSON: ${data}`));
+        }
+      });
+    });
+
+    r.on('error', reject);
+    if (body) r.write(body);
+    r.end();
   });
-  const text = await res.text();
-  let json = null;
-  try { json = JSON.parse(text); } catch {}
-  if (!res.ok) throw new Error(`API ${res.status}: ${text}`);
-  return json;
 }
 
-bot.onText(/^\/start(?:\s+(.+))?$/i, async (msg, m) => {
+function api(path) {
+  return SITE_URL + path;
+}
+
+async function bindByCode(chatId, tgUser, code) {
+  const payload = {
+    code,
+    telegramId: String(chatId),
+    username: tgUser?.username || '',
+    firstName: tgUser?.first_name || '',
+  };
+  return reqJson('POST', api('/api/twofa/bot_bind.php'), payload);
+}
+
+async function markQueue(id, status, errorText) {
+  return reqJson('POST', api('/api/twofa/bot_mark.php'), {
+    id,
+    status,
+    errorText: errorText || null,
+  });
+}
+
+async function setSession(sessionId, action) {
+  return reqJson('POST', api('/api/twofa/bot_session.php'), {
+    sessionId,
+    action,
+  });
+}
+
+function buildKeyboard(sessionId) {
+  return {
+    inline_keyboard: [
+      [
+        { text: '✅ Подтвердить', callback_data: `2fa:approve:${sessionId}` },
+        { text: '❌ Отклонить', callback_data: `2fa:deny:${sessionId}` },
+      ],
+    ],
+  };
+}
+
+async function processQueueItem(item) {
+  const chatId = item.telegram_id;
+  const sessionId = item.session_id;
+
+  const text =
+    `🔐 Sakura Client — подтверждение входа\n\n` +
+    `Аккаунт: ${item.username}\n` +
+    `Сессия: ${sessionId}\n\n` +
+    `Если это ты — нажми ✅ Подтвердить. Если нет — ❌ Отклонить.`;
+
+  try {
+    await bot.sendMessage(chatId, text, {
+      reply_markup: buildKeyboard(sessionId),
+      disable_web_page_preview: true,
+    });
+    await markQueue(item.id, 'sent', null);
+  } catch (e) {
+    await markQueue(item.id, 'error', String(e && e.message ? e.message : e));
+  }
+}
+
+let pollingBusy = false;
+
+async function pollQueue() {
+  if (pollingBusy) return;
+  pollingBusy = true;
+  try {
+    const data = await reqJson('GET', api('/api/twofa/bot_pull.php?limit=10'), null);
+    const items = Array.isArray(data.items) ? data.items : [];
+    for (const item of items) {
+      if (!item || !item.id) continue;
+      await processQueueItem(item);
+    }
+  } catch (e) {
+    // молча, чтобы не спамить логи
+  } finally {
+    pollingBusy = false;
+  }
+}
+
+bot.onText(/^\/start(?:\s+([A-Za-z0-9_-]{8,80}))?/, async (msg, match) => {
   const chatId = msg.chat.id;
-  const code = (m[1] || '').trim();
+  const code = (match && match[1]) ? String(match[1]).trim() : '';
 
   if (!code) {
-    bot.sendMessage(chatId, '✅ Бот работает. Открой ссылку привязки из профиля сайта.');
+    return bot.sendMessage(chatId, '✅ Bothost OK. Бот живой.\n\nПришли /start <код> из сайта, чтобы привязать 2FA.');
+  }
+
+  try {
+    const r = await bindByCode(chatId, msg.from, code);
+    if (r && r.ok) {
+      return bot.sendMessage(chatId, '✅ Привязка успешна. Теперь включи 2FA в профиле на сайте.');
+    }
+    return bot.sendMessage(chatId, '❌ Не получилось привязать. Проверь, что код ещё не истёк и правильный.');
+  } catch (e) {
+    return bot.sendMessage(chatId, '❌ Ошибка привязки: ' + (e && e.message ? e.message : String(e)));
+  }
+});
+
+bot.on('callback_query', async (cq) => {
+  const data = String(cq.data || '');
+  const m = data.match(/^2fa:(approve|deny):([a-f0-9]{32,64})$/i);
+  if (!m) {
+    try { await bot.answerCallbackQuery(cq.id, { text: 'Неизвестное действие' }); } catch {}
     return;
   }
 
-  try {
-    const r = await api('/api/twofa/bot_bind.php', 'POST', {
-      code,
-      telegram_id: String(chatId),
-      username: msg.from?.username ? String(msg.from.username) : ''
-    });
-
-    if (r && r.ok) {
-      bot.sendMessage(chatId, '✅ Telegram привязан к аккаунту. Теперь при входе будет приходить запрос на подтверждение.');
-    } else {
-      bot.sendMessage(chatId, '❌ Не получилось привязать. Сгенерируй новую ссылку в профиле и попробуй ещё раз.');
-    }
-  } catch (e) {
-    bot.sendMessage(chatId, '❌ Ошибка привязки. Проверь сайт/эндпоинт.');
-  }
-});
-
-bot.on('callback_query', async (q) => {
-  const data = String(q.data || '');
-  const chatId = q.message?.chat?.id;
-  if (!chatId) return;
-
-  const m = data.match(/^2fa:(approve|deny):([A-Za-z0-9_-]{8,128})$/);
-  if (!m) return;
-
-  const action = m[1];
+  const action = m[1].toLowerCase();
   const sessionId = m[2];
 
   try {
-    await api('/api/twofa/bot_action.php', 'POST', {
-      action,
-      session_id: sessionId,
-      telegram_id: String(chatId)
-    });
+    const r = await setSession(sessionId, action);
+    if (r && r.ok) {
+      const msgText = action === 'approve'
+        ? '✅ Вход подтверждён.'
+        : '❌ Вход отклонён.';
 
-    await bot.answerCallbackQuery(q.id, { text: action === 'approve' ? '✅ Подтверждено' : '❌ Отклонено' });
-    try {
-      await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: q.message.message_id });
-    } catch {}
+      try { await bot.answerCallbackQuery(cq.id, { text: msgText, show_alert: false }); } catch {}
+      try {
+        await bot.editMessageText(msgText, {
+          chat_id: cq.message.chat.id,
+          message_id: cq.message.message_id,
+        });
+      } catch {}
+      return;
+    }
+    try { await bot.answerCallbackQuery(cq.id, { text: 'Ошибка сайта', show_alert: true }); } catch {}
   } catch (e) {
-    await bot.answerCallbackQuery(q.id, { text: 'Ошибка. Попробуй ещё раз.' });
+    try { await bot.answerCallbackQuery(cq.id, { text: 'Ошибка: ' + (e && e.message ? e.message : String(e)), show_alert: true }); } catch {}
   }
 });
 
-async function tick() {
-  try {
-    const r = await api('/api/twofa/bot_pull.php', 'GET');
-    const items = Array.isArray(r?.items) ? r.items : [];
-    for (const it of items) {
-      const tid = String(it.telegram_id || '');
-      const sid = String(it.session_id || '');
-      if (!tid || !sid) continue;
+// запуск очереди
+setInterval(pollQueue, 2500);
 
-      const text =
-        '🔐 Подтверждение входа\n' +
-        (it.ip ? `IP: ${it.ip}\n` : '') +
-        (it.when ? `Время: ${it.when}\n` : '') +
-        '\nПодтвердить вход?';
-
-      await bot.sendMessage(tid, text, {
-        reply_markup: {
-          inline_keyboard: [[
-            { text: '✅ Approve', callback_data: `2fa:approve:${sid}` },
-            { text: '❌ Deny', callback_data: `2fa:deny:${sid}` }
-          ]]
-        }
-      });
-
-      await api('/api/twofa/bot_ack.php', 'POST', { id: it.id });
-    }
-  } catch {}
-  setTimeout(tick, 2000);
-}
-
-tick();
+// стартовый пинг
+bot.sendMessage(process.env.ADMIN_CHAT_ID ? Number(process.env.ADMIN_CHAT_ID) : undefined, '').catch(() => {});
+console.log('Bot started. Polling + queue enabled.');
