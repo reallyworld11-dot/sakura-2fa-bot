@@ -12,20 +12,33 @@ if (!BOT_API_SECRET) throw new Error('ENV BOT_API_SECRET is empty');
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
+const httpsAgent = new https.Agent({ keepAlive: true });
+const httpAgent = new http.Agent({ keepAlive: true });
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 function reqJson(method, urlStr, bodyObj) {
   return new Promise((resolve, reject) => {
     const u = new URL(urlStr);
-    const lib = u.protocol === 'https:' ? https : http;
+    const isHttps = u.protocol === 'https:';
+    const lib = isHttps ? https : http;
 
     const body = bodyObj ? Buffer.from(JSON.stringify(bodyObj), 'utf8') : null;
 
     const opts = {
       method,
       hostname: u.hostname,
-      port: u.port || (u.protocol === 'https:' ? 443 : 80),
+      port: u.port || (isHttps ? 443 : 80),
       path: u.pathname + (u.search || ''),
+      agent: isHttps ? httpsAgent : httpAgent,
+      family: 4,
+      servername: u.hostname,
+      timeout: 15000,
       headers: {
         'Content-Type': 'application/json; charset=utf-8',
+        'User-Agent': 'sakura-2fa-bot/1.0',
         'X-Bot-Secret': BOT_API_SECRET,
       },
     };
@@ -36,20 +49,34 @@ function reqJson(method, urlStr, bodyObj) {
       let data = '';
       res.on('data', (c) => (data += c));
       res.on('end', () => {
-        try {
-          const j = data ? JSON.parse(data) : {};
-          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) return resolve(j);
-          return reject(new Error(`HTTP ${res.statusCode}: ${data}`));
-        } catch (e) {
-          return reject(new Error(`Bad JSON: ${data}`));
-        }
+        let j = {};
+        try { j = data ? JSON.parse(data) : {}; } catch {}
+        if (res.statusCode >= 200 && res.statusCode < 300) return resolve(j);
+        return reject(new Error(`HTTP ${res.statusCode}: ${data || JSON.stringify(j)}`));
       });
+    });
+
+    r.on('timeout', () => {
+      r.destroy(new Error('ETIMEDOUT'));
     });
 
     r.on('error', reject);
     if (body) r.write(body);
     r.end();
   });
+}
+
+async function reqJsonRetry(method, url, body, retries = 3) {
+  let lastErr = null;
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await reqJson(method, url, body);
+    } catch (e) {
+      lastErr = e;
+      await sleep(600 + i * 700);
+    }
+  }
+  throw lastErr;
 }
 
 function api(path) {
@@ -63,22 +90,22 @@ async function bindByCode(chatId, tgUser, code) {
     username: tgUser?.username || '',
     firstName: tgUser?.first_name || '',
   };
-  return reqJson('POST', api('/api/2fa/bot_bind'), payload);
+  return reqJsonRetry('POST', api('/api/twofa/bot_bind.php'), payload, 3);
 }
 
 async function markQueue(id, status, errorText) {
-  return reqJson('POST', api('/api/2fa/bot_mark'), {
+  return reqJsonRetry('POST', api('/api/twofa/bot_mark.php'), {
     id,
     status,
     errorText: errorText || null,
-  });
+  }, 3);
 }
 
 async function setSession(sessionId, action) {
-  return reqJson('POST', api('/api/2fa/bot_session'), {
+  return reqJsonRetry('POST', api('/api/twofa/bot_session.php'), {
     sessionId,
     action,
-  });
+  }, 3);
 }
 
 function buildKeyboard(sessionId) {
@@ -119,27 +146,26 @@ async function pollQueue() {
   if (pollingBusy) return;
   pollingBusy = true;
   try {
-    const data = await reqJson('GET', api('/api/2fa/bot_pull?limit=10'), null);
+    const data = await reqJsonRetry('GET', api('/api/twofa/bot_pull.php?limit=10'), null, 3);
     const items = Array.isArray(data.items) ? data.items : [];
     for (const item of items) {
       if (!item || !item.id) continue;
       await processQueueItem(item);
     }
-  } catch (e) {
-    // молча, чтобы не спамить логи
-  } finally {
+  } catch {}
+  finally {
     pollingBusy = false;
   }
 }
 
-bot.onText(/^\/start(?:\s+([A-Za-z0-9_-]{8,128}))?/i, async (msg, match) => {
+bot.onText(/^\/start(?:\s+([A-Za-z0-9_-]{8,120}))?/, async (msg, match) => {
   const chatId = msg.chat.id;
   const code = (match && match[1]) ? String(match[1]).trim() : '';
 
   if (!code) {
     return bot.sendMessage(
       chatId,
-      '✅ Bothost OK. Бот живой.\n\nПришли /start <код> из сайта, чтобы привязать 2FA.'
+      '✅ Bothost OK. Бот живой.\n\nОткрой ссылку из сайта (или пришли /start <код>) чтобы привязать Telegram 2FA.'
     );
   }
 
@@ -156,7 +182,7 @@ bot.onText(/^\/start(?:\s+([A-Za-z0-9_-]{8,128}))?/i, async (msg, match) => {
 
 bot.on('callback_query', async (cq) => {
   const data = String(cq.data || '');
-  const m = data.match(/^2fa:(approve|deny):([A-Za-z0-9_-]{8,128})$/);
+  const m = data.match(/^2fa:(approve|deny):([A-Za-z0-9_-]{8,120})$/i);
   if (!m) {
     try { await bot.answerCallbackQuery(cq.id, { text: 'Неизвестное действие' }); } catch {}
     return;
@@ -168,10 +194,7 @@ bot.on('callback_query', async (cq) => {
   try {
     const r = await setSession(sessionId, action);
     if (r && r.ok) {
-      const msgText = action === 'approve'
-        ? '✅ Вход подтверждён.'
-        : '❌ Вход отклонён.';
-
+      const msgText = action === 'approve' ? '✅ Вход подтверждён.' : '❌ Вход отклонён.';
       try { await bot.answerCallbackQuery(cq.id, { text: msgText, show_alert: false }); } catch {}
       try {
         await bot.editMessageText(msgText, {
@@ -183,16 +206,9 @@ bot.on('callback_query', async (cq) => {
     }
     try { await bot.answerCallbackQuery(cq.id, { text: 'Ошибка сайта', show_alert: true }); } catch {}
   } catch (e) {
-    try {
-      await bot.answerCallbackQuery(cq.id, {
-        text: 'Ошибка: ' + (e && e.message ? e.message : String(e)),
-        show_alert: true,
-      });
-    } catch {}
+    try { await bot.answerCallbackQuery(cq.id, { text: 'Ошибка: ' + (e && e.message ? e.message : String(e)), show_alert: true }); } catch {}
   }
 });
 
-// запуск очереди
 setInterval(pollQueue, 2500);
-
 console.log('Bot started. Polling + queue enabled.');
